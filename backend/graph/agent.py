@@ -145,9 +145,9 @@ class AgentManager:
                 if isinstance(usage_candidate, dict):
                     last_usage = usage_candidate
 
-                # 只转发主 agent 节点的 token；跳过 guardian middleware 等非 agent 节点的 LLM 输出
+                # 只转发 model 节点的 token；跳过 guardian 等非 model 节点的 LLM 输出
                 node = metadata.get("langgraph_node") if isinstance(metadata, dict) else None
-                if node is not None and node != "agent":
+                if node is not None and node != "model":
                     continue
 
                 text = _stringify_content(getattr(chunk, "content", ""))
