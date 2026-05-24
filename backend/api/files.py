@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 
 from graph.agent import agent_manager
@@ -11,6 +13,18 @@ from service.memory_indexer import memory_indexer
 from tools.skills_scanner import refresh_snapshot, scan_skills
 
 router = APIRouter()
+
+UPLOAD_DIR = Path(__file__).resolve().parent.parent / "data" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_UPLOAD_MIME = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "text/plain",
+    "text/markdown",
+    "text/x-markdown",
+}
 
 ALLOWED_PREFIXES = (
     "workspace/",
@@ -95,6 +109,106 @@ async def save_file(payload: SaveFileRequest) -> dict[str, Any]:
         refresh_snapshot(agent_manager.base_dir)
 
     return {"ok": True, "path": normalized}
+
+
+@router.post("/upload")
+async def upload_file(file: UploadFile = File(...)) -> dict[str, Any]:
+    """上传合同文件到 data/uploads/，返回文件信息。"""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+
+    mime = file.content_type or "application/octet-stream"
+    if mime not in ALLOWED_UPLOAD_MIME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件类型：{mime}。支持的类型：PDF、Word、Markdown、纯文本",
+        )
+
+    # 同名去重：删除之前上传的同名文件
+    for existing in UPLOAD_DIR.iterdir():
+        if existing.is_file() and existing.name.endswith(f"_{file.filename}"):
+            existing.unlink()
+
+    unique_name = f"{uuid.uuid4().hex[:12]}_{file.filename}"
+    save_path = UPLOAD_DIR / unique_name
+
+    with open(save_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return {
+        "ok": True,
+        "filename": file.filename,
+        "saved_path": str(save_path.resolve()),
+        "content_type": mime,
+    }
+
+
+@router.get("/contracts")
+async def list_contracts() -> dict[str, list[dict[str, Any]]]:
+    """列出 data/uploads/ 中所有已上传的合同文件。"""
+    if not UPLOAD_DIR.exists():
+        return {"files": []}
+
+    files: list[dict[str, Any]] = []
+    for fpath in sorted(UPLOAD_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not fpath.is_file():
+            continue
+        stat = fpath.stat()
+        files.append({
+            "filename": fpath.name,
+            "path": str(fpath.resolve()),
+            "size": stat.st_size,
+            "uploaded_at": stat.st_mtime,
+        })
+    return {"files": files}
+
+
+@router.delete("/contracts")
+async def delete_contract(filename: str = Query(..., min_length=1)) -> dict[str, Any]:
+    """删除指定合同文件。"""
+    target = UPLOAD_DIR / filename
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+    if not target.is_relative_to(UPLOAD_DIR):
+        raise HTTPException(status_code=400, detail="路径越权")
+    target.unlink()
+    return {"ok": True, "filename": filename}
+
+
+class IngestRequest(BaseModel):
+    source_path: str = Field(..., min_length=1)
+    doc_name: str = Field(default="")
+    session_id: str | None = None
+    batch_id: str | None = None
+    project_id: str | None = None
+    company_id: str | None = None
+
+
+@router.post("/documents/ingest")
+async def ingest_document(payload: IngestRequest) -> dict[str, Any]:
+    """将文档入库：MinerU 解析（PDF/Word）→ 切分 → SQLite + Chroma + FTS5。"""
+    from service.document_indexer import document_indexer
+
+    result = document_indexer.ingest(
+        source_path=payload.source_path,
+        doc_name=payload.doc_name,
+        session_id=payload.session_id,
+        batch_id=payload.batch_id,
+        project_id=payload.project_id,
+        company_id=payload.company_id,
+    )
+    return result
+
+
+@router.get("/documents")
+async def list_documents(
+    session_id: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+) -> dict[str, list[dict[str, Any]]]:
+    """列出已入库的文档。"""
+    from service.document_indexer import document_indexer
+    docs = document_indexer.list_documents(session_id=session_id, project_id=project_id)
+    return {"documents": docs}
 
 
 @router.get("/skills")

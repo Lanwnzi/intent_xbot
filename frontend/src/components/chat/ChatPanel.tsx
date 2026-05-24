@@ -7,7 +7,7 @@ import { ChatMessage } from "@/components/chat/ChatMessage";
 import { useAppStore } from "@/lib/store";
 
 export function ChatPanel() {
-  const { messages, sendMessage, isStreaming, tokenStats } = useAppStore();
+  const { messages, sendMessage, addReviewResult, isStreaming, tokenStats } = useAppStore();
   const endRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -58,7 +58,7 @@ export function ChatPanel() {
         </div>
       </div>
 
-      <ChatInput disabled={isStreaming} onSend={sendMessage} />
+      <ChatInput disabled={isStreaming} onSend={sendMessage} onReviewResult={addReviewResult} />
     </section>
   );
 }

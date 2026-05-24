@@ -52,6 +52,7 @@ type AppStore = {
   createNewSession: () => Promise<void>;
   selectSession: (sessionId: string) => Promise<void>;
   sendMessage: (value: string) => Promise<void>;
+  addReviewResult: (content: string) => void;
   toggleRagMode: () => Promise<void>;
   renameCurrentSession: (title: string) => Promise<void>;
   removeSession: (sessionId: string) => Promise<void>;
@@ -338,6 +339,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
     await refreshSkills();
   }
 
+  function addReviewResult(content: string) {
+    const reviewMsg: Message = {
+      id: makeId(),
+      role: "assistant",
+      content,
+      toolCalls: [],
+      retrievals: [],
+    };
+    setMessages((prev) => [...prev, reviewMsg]);
+  }
+
   async function compressCurrentSession() {
     if (!currentSessionId) {
       return;
@@ -391,6 +403,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     createNewSession,
     selectSession,
     sendMessage,
+    addReviewResult,
     toggleRagMode,
     renameCurrentSession,
     removeSession,

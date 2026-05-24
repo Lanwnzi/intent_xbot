@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
+
 from api.chat import router as chat_router
 from api.compress import router as compress_router
 from api.config_api import router as config_router
+from api.contracts import router as contracts_router
 from api.files import router as files_router
 from api.sessions import router as sessions_router
 from api.tokens import router as tokens_router
@@ -50,6 +54,7 @@ app.include_router(files_router, prefix="/api", tags=["files"])
 app.include_router(tokens_router, prefix="/api", tags=["tokens"])
 app.include_router(compress_router, prefix="/api", tags=["compress"])
 app.include_router(config_router, prefix="/api", tags=["config"])
+app.include_router(contracts_router, prefix="/api", tags=["contracts"])
 
 
 @app.get("/health")

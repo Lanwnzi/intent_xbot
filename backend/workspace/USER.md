@@ -9,3 +9,7 @@
 - **喜欢的足球队**: 多特蒙德（Borussia Dortmund）
 - **喜欢的球星**: 罗伊斯（Marco Reus）- 多特蒙德传奇球星
 - **姓名**: Jimmy
+
+## 会话偏好记录
+
+- **称呼设定**: 用户称呼 Agent 为"LWZ"，Agent 以"LWZ的助理"身份回应

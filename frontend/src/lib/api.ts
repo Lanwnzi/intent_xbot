@@ -96,6 +96,96 @@ export async function getSessionTokens(sessionId: string) {
   }>(`/tokens/session/${sessionId}`);
 }
 
+export async function uploadFile(file: File): Promise<{
+  ok: boolean;
+  filename: string;
+  saved_path: string;
+  content_type: string;
+}> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(`${getApiBase()}/upload`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `Upload failed: ${response.status}`);
+  }
+
+  return (await response.json()) as {
+    ok: boolean;
+    filename: string;
+    saved_path: string;
+    content_type: string;
+  };
+}
+
+export async function ingestDocument(sourcePath: string, docName?: string): Promise<{
+  ok?: boolean;
+  doc_id?: string;
+  doc_name?: string;
+  chunk_count?: number;
+  error?: string;
+}> {
+  return request<{
+    ok?: boolean;
+    doc_id?: string;
+    doc_name?: string;
+    chunk_count?: number;
+    error?: string;
+  }>("/documents/ingest", {
+    method: "POST",
+    body: JSON.stringify({ source_path: sourcePath, doc_name: docName || "" }),
+  });
+}
+
+export async function reviewContract(filePath: string, contractName?: string): Promise<{
+  report_id: string;
+  report_path: string;
+  summary: string;
+  risk_count: { high: number; medium: number; low: number };
+  contract_name: string;
+}> {
+  return request<{
+    report_id: string;
+    report_path: string;
+    summary: string;
+    risk_count: { high: number; medium: number; low: number };
+    contract_name: string;
+  }>("/contracts/review", {
+    method: "POST",
+    body: JSON.stringify({ file_path: filePath, contract_name: contractName || "" }),
+  });
+}
+
+export async function listContracts(): Promise<{
+  files: Array<{
+    filename: string;
+    path: string;
+    size: number;
+    uploaded_at: number;
+  }>;
+}> {
+  return request<{
+    files: Array<{
+      filename: string;
+      path: string;
+      size: number;
+      uploaded_at: number;
+    }>;
+  }>("/contracts");
+}
+
+export async function deleteContract(filename: string) {
+  return request<{ ok: boolean }>(
+    `/contracts?filename=${encodeURIComponent(filename)}`,
+    { method: "DELETE" }
+  );
+}
+
 export async function listSkills() {
   return request<Array<{ name: string; description: string; path: string }>>("/skills");
 }

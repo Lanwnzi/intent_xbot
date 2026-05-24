@@ -4,6 +4,7 @@ from pathlib import Path
 
 from langchain_core.tools import BaseTool
 
+from tools.contract_sub_agent_tool import ContractSubAgentTool
 from tools.fetch_url_tool import FetchURLTool
 from tools.python_repl_tool import PythonReplTool
 from tools.read_file_tool import ReadFileTool
@@ -11,11 +12,18 @@ from tools.terminal_tool import TerminalTool
 
 
 def get_all_tools(base_dir: Path) -> list[BaseTool]:
+    """主 Agent 工具列表。
+
+    通用工具（terminal, python_repl, read_file, fetch_url）直接注册。
+    合同处理工具（contract_review, document_retrieval, list_documents, list_contracts）
+    封装在 ContractSubAgentTool 子 Agent 中，主 Agent 通过此工具调用合同处理专家。
+    """
     tools: list[BaseTool] = [
         TerminalTool(root_dir=base_dir),
         PythonReplTool(root_dir=base_dir),
         FetchURLTool(),
         ReadFileTool(root_dir=base_dir),
+        ContractSubAgentTool(root_dir=base_dir),
     ]
 
     from memory_module_v2.service.config import get_memory_backend, get_memory_v2_inject_mode
