@@ -1,4 +1,4 @@
-# OpenClaw Chat Platform
+# Personal Agent Platform
 
 > 一个本地优先、文件驱动、透明可控的 AI Agent 工作台 —— 支持多 LLM 后端、提示注入防御、双层长期记忆与可插拔技能系统。
 
