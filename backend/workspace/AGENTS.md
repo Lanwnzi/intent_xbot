@@ -15,6 +15,7 @@
 - `terminal`: 仅在需要运行本地命令时使用。
 - `python_repl`: 仅用于短脚本和数据处理。
 - `fetch_url`: 获取网页或 JSON 接口内容。
+- `contract_expert`: 合同处理专家子Agent。**所有合同/文档任务必须优先使用此工具**：审核合同、检索合同条款、列出可用合同、批量入库文档。不要用 read_file 处理合同文件，合同相关请求统一交给 contract_expert。
 - `search_memory`: （仅 MEMORY_BACKEND=v2 + MEMORY_V2_INJECT=tool 时可用）检索跨会话的长期记忆，返回历史对话的蒸馏摘要和原始片段。当用户提到历史话题或需要回忆过去讨论时主动调用。
 - `distill_session`: （仅 MEMORY_BACKEND=v2 时可用）手动触发当前会话的蒸馏，将对话压缩为结构化记忆。
 

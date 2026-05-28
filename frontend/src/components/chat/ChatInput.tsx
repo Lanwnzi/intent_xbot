@@ -40,7 +40,7 @@ export function ChatInput({
   async function doUpload(file: File): Promise<string> {
     const result = await uploadFile(file);
     // 异步入库（不等）
-    void ingestDocument(result.saved_path).then((r) => {
+    void ingestDocument(result.saved_path, file.name).then((r) => {
       if (r.ok) console.log("[ingest] 入库成功:", r.doc_id, r.chunk_count, "chunks");
       else console.warn("[ingest] 入库失败:", r.error);
     }).catch((err) => { console.warn("[ingest] 入库异常:", err); });

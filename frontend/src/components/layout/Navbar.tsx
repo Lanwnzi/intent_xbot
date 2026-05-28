@@ -2,12 +2,18 @@
 
 import { useState, useEffect } from "react";
 import { createPortal } from "react-dom";
-import { Database, FileStack, Plus, Sparkles, Wrench, SlidersHorizontal } from "lucide-react";
+import { Database, FileStack, FolderOpen, Plus, Sparkles, Wrench, SlidersHorizontal } from "lucide-react";
 
 import { useAppStore } from "@/lib/store";
 import { InspectorPanel } from "@/components/editor/InspectorPanel";
 
-export function Navbar() {
+export function Navbar({
+  showBatchPanel = false,
+  onBatchPanelToggle,
+}: {
+  showBatchPanel?: boolean;
+  onBatchPanelToggle?: () => void;
+}) {
   const [isInspectorOpen, setIsInspectorOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
 
@@ -89,6 +95,16 @@ export function Navbar() {
           <FileStack size={16} />
           File-first Memory
         </div>
+        <button
+          className={`flex h-9 w-9 items-center justify-center rounded-full border text-[var(--color-ink-soft)] hover:bg-white/80 hover:text-ink ${
+            showBatchPanel ? "bg-ocean text-white" : "border-[var(--color-line)] bg-white/60"
+          }`}
+          onClick={onBatchPanelToggle}
+          title="批量文档入库"
+          type="button"
+        >
+          <FolderOpen size={16} />
+        </button>
         <button
           className="flex h-9 w-9 items-center justify-center rounded-full border border-[var(--color-line)] bg-white/60 text-[var(--color-ink-soft)] hover:bg-white/80 hover:text-ink"
           onClick={() => setIsInspectorOpen(true)}

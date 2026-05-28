@@ -21,6 +21,12 @@ MIME_MAP = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".doc": "application/msword",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
 }
 
 
@@ -54,18 +60,20 @@ def _write_manifest(manifest: dict[str, str]) -> None:
     )
 
 
-def parse_with_mineru(file_path: Path) -> str:
+def parse_with_mineru(file_path: Path, file_hash: str | None = None) -> str:
     """调用本地 MinerU API 将 PDF/Word 解析为 Markdown。
 
     先检查 SHA256 缓存（data/parsed/{hash}.md），命中则跳过解析。
+    如果调用方已计算好 file_hash，传入可避免重复 SHA256 计算。
     """
     t_total = time.perf_counter()
 
-    # 计算 hash，检查缓存
+    # 计算 hash（外部传入或自动计算），检查缓存
     t_hash = time.perf_counter()
-    file_hash = _compute_sha256(file_path)
-    cache_path = _get_cache_path(file_hash)
+    if file_hash is None:
+        file_hash = _compute_sha256(file_path)
     hash_time = time.perf_counter() - t_hash
+    cache_path = _get_cache_path(file_hash)
 
     if cache_path.exists():
         t_read = time.perf_counter()

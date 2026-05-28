@@ -13,8 +13,8 @@ from service.document_indexer import document_indexer
 
 
 class DocumentRetrievalInput(BaseModel):
-    query: str = Field(..., description="检索查询，如'违约责任条款'、'保密义务'等")
-    doc_id: str | None = Field(default=None, description="指定文档 ID，如 DOC-20260524-001")
+    query: str = Field(..., description="检索查询，例如：违约责任条款、保密义务")
+    doc_id: str | None = Field(default=None, description="指定文档 ID，例如 DOC-20260524-001")
     session_id: str | None = Field(default=None, description="按会话过滤")
     project_id: str | None = Field(default=None, description="按项目过滤")
     company_id: str | None = Field(default=None, description="按公司过滤")
@@ -27,7 +27,6 @@ class DocumentRetrievalTool(BaseTool):
         "在已入库的合同/报告文档中执行混合检索（向量 + 全文）。"
         "必须指定检索范围（doc_id / session_id / project_id / company_id 至少一个），不能全库检索。"
         "返回带来源 metadata 的文档片段。"
-        "当用户询问合同内容、报告细节、条款信息时使用此工具。"
     )
     args_schema: Type[BaseModel] = DocumentRetrievalInput
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -44,7 +43,7 @@ class DocumentRetrievalTool(BaseTool):
         session_id: str | None = None,
         project_id: str | None = None,
         company_id: str | None = None,
-        top_k: int = 5,
+        top_k: int = 10,
         run_manager: CallbackManagerForToolRun | None = None,
     ) -> str:
         results = document_indexer.retrieve(
@@ -57,7 +56,7 @@ class DocumentRetrievalTool(BaseTool):
         )
 
         if not results:
-            return "未找到相关文档内容。请确认检索范围和查询关键词是否正确。"
+            return "未找到相关文档内容，请确认检索范围和查询词。"
 
         if isinstance(results[0], dict) and "error" in results[0]:
             return f"检索失败: {results[0]['error']}"
@@ -93,16 +92,15 @@ class DocumentRetrievalTool(BaseTool):
 
 
 class DocumentListInput(BaseModel):
-    """无需参数，列出当前库中已入库的文档。"""
-
     session_id: str | None = Field(default=None, description="按会话过滤")
 
 
 class DocumentListTool(BaseTool):
     name: str = "list_documents"
     description: str = (
-        "列出所有已入库的合同/报告文档及状态（ready/ingesting/error）。"
-        "可用于在检索前了解可用的文档资源。"
+        "列出所有已入库的合同/报告文档及状态（indexed/failed/ingesting/indexing）。"
+        "用于在检索前了解可用文档。"
+        "返回结果按最近入库时间倒序排列；当用户没有明确指定文档时，可优先展示前 3 个候选让用户确认。"
     )
     args_schema: Type[BaseModel] = DocumentListInput
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -119,22 +117,24 @@ class DocumentListTool(BaseTool):
     ) -> str:
         docs = document_indexer.list_documents(session_id=session_id, status=None)
         if not docs:
-            return "当前库中没有任何文档。请先将合同/报告文件入库。"
+            return "当前库中没有任何文档，请先将合同/报告文件入库。"
 
-        lines = ["已入库文档列表：", ""]
+        status_map = {
+            "indexed": "就绪",
+            "failed": "失败",
+            "indexing": "索引中",
+            "ingesting": "处理中",
+        }
+
+        lines = [
+            "已入库文档列表：",
+            "",
+            "| 序号 | 文件名 | 文档ID | 状态 |",
+            "|---|---|---|---|",
+        ]
         for idx, doc in enumerate(docs, start=1):
-            status_label = {"ready": "就绪", "ingesting": "处理中", "error": "错误"}.get(
-                doc.get("status", ""), doc.get("status", "")
-            )
-            lines.append(
-                f"{idx}. [{status_label}] {doc['doc_name']} "
-                f"(doc_id={doc['doc_id']}, chunks={doc['chunk_count']}, "
-                f"chars={doc['char_count']})"
-            )
-            if doc.get("project_id"):
-                lines.append(f"   项目: {doc['project_id']}")
-            if doc.get("error_message"):
-                lines.append(f"   错误: {doc['error_message']}")
+            status_label = status_map.get(str(doc.get("status", "")), str(doc.get("status", "")))
+            lines.append(f"| {idx} | {doc['doc_name']} | {doc['doc_id']} | {status_label} |")
 
         return "\n".join(lines)
 

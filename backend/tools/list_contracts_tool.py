@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Type
 
 from langchain_core.callbacks.manager import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from langchain_core.tools import BaseTool
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "data" / "uploads"
 
 
 class ListContractsInput(BaseModel):
-    """无需参数，列出所有已上传的合同文件。"""
+    """No args: list raw uploaded files under backend/data/uploads."""
 
     pass
 
@@ -22,8 +21,9 @@ class ListContractsInput(BaseModel):
 class ListContractsTool(BaseTool):
     name: str = "list_contracts"
     description: str = (
-        "列出所有已上传到库中的合同文件。"
-        "当用户要求审核合同但未指定具体文件时，先调用此工具查看可用合同列表。"
+        "DEBUG ONLY. List raw files from backend/data/uploads. "
+        "This is not the source of truth for ingested contracts and may contain duplicates. "
+        "For business contract list, use list_documents."
     )
     args_schema: Type[BaseModel] = ListContractsInput
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -41,22 +41,25 @@ class ListContractsTool(BaseTool):
         files = sorted(UPLOAD_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
 
         if not files:
-            return "当前库中没有任何合同文件。请先上传文件。"
+            return "[DEBUG uploads] No files found in backend/data/uploads."
 
-        lines = ["当前库中的合同文件：", ""]
-        for idx, fpath in enumerate(files, start=1):
+        lines = [
+            "[DEBUG uploads] Raw uploaded files (may include duplicates):",
+            "Use list_documents for database-backed contract list.",
+            "",
+        ]
+        idx = 1
+        for fpath in files:
             if not fpath.is_file():
                 continue
             stat = fpath.stat()
             size_kb = stat.st_size / 1024
             mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-            # 去掉 uuid 前缀，显示原始文件名
-            display_name = fpath.name
-            if "_" in display_name:
-                display_name = display_name.split("_", 1)[-1]
+            display_name = fpath.name.split("_", 1)[-1] if "_" in fpath.name else fpath.name
 
-            lines.append(f"{idx}. {display_name} ({size_kb:.1f} KB, 上传于 {mtime})")
-            lines.append(f"   路径: {fpath.resolve()}")
+            lines.append(f"{idx}. {display_name} ({size_kb:.1f} KB, uploaded_at={mtime} UTC)")
+            lines.append(f"   path: {fpath.resolve()}")
+            idx += 1
 
         return "\n".join(lines)
 

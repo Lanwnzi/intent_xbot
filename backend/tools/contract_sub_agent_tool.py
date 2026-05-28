@@ -35,9 +35,9 @@ class ContractSubAgentTool(BaseTool):
     name: str = "contract_expert"
     description: str = (
         "合同处理专家，负责所有合同相关任务："
-        "1) 审核合同并生成审核报告（用户说'审核合同'时使用）；"
-        "2) 检索合同文档内容（用户问'合同里关于X的条款'时使用）；"
-        "3) 列出可用的合同文件。"
+        "1 审核合同并生成审核报告（用户说'审核合同'时使用）；"
+        "2 检索合同文档内容（用户问'合同里关于X的条款'时使用）；"
+        "3 列出可用的合同文件。"
         "传入完整的用户需求作为 task 参数，子 Agent 会自动选择合适工具执行。"
     )
     args_schema: Type[BaseModel] = ContractSubAgentInput

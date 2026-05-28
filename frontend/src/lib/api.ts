@@ -161,6 +161,32 @@ export async function reviewContract(filePath: string, contractName?: string): P
   });
 }
 
+export type IngestedDocument = {
+  doc_id: string;
+  doc_name: string;
+  source_path: string;
+  status: string;
+  session_id?: string | null;
+  project_id?: string | null;
+  company_id?: string | null;
+  chunk_count?: number;
+  char_count?: number;
+  created_at?: string;
+  updated_at?: string;
+  error_message?: string | null;
+};
+
+export async function listDocuments(params?: {
+  sessionId?: string | null;
+  projectId?: string | null;
+}): Promise<{ documents: IngestedDocument[] }> {
+  const qs = new URLSearchParams();
+  if (params?.sessionId) qs.set("session_id", params.sessionId);
+  if (params?.projectId) qs.set("project_id", params.projectId);
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return request<{ documents: IngestedDocument[] }>(`/documents${suffix}`);
+}
+
 export async function listContracts(): Promise<{
   files: Array<{
     filename: string;
@@ -169,14 +195,16 @@ export async function listContracts(): Promise<{
     uploaded_at: number;
   }>;
 }> {
-  return request<{
-    files: Array<{
-      filename: string;
-      path: string;
-      size: number;
-      uploaded_at: number;
-    }>;
-  }>("/contracts");
+  // Keep compatibility with older UI callers, but switch source-of-truth to DB documents.
+  const result = await listDocuments();
+  return {
+    files: result.documents.map((doc) => ({
+      filename: doc.doc_name,
+      path: doc.source_path,
+      size: 0,
+      uploaded_at: doc.created_at ? Math.floor(Date.parse(doc.created_at) / 1000) : 0,
+    })),
+  };
 }
 
 export async function deleteContract(filename: string) {
@@ -184,6 +212,73 @@ export async function deleteContract(filename: string) {
     `/contracts?filename=${encodeURIComponent(filename)}`,
     { method: "DELETE" }
   );
+}
+
+export type BatchItem = {
+  filename?: string;
+  source_path?: string;
+  doc_name?: string;
+  status: string;
+  job_id?: string;
+  doc_id?: string;
+  cached?: boolean;
+  error?: string;
+  error_message?: string;
+};
+
+export type BatchIngestResult = {
+  ok: boolean;
+  batch_id: string;
+  total: number;
+  items: BatchItem[];
+};
+
+export async function batchIngestDocuments(
+  files: File[],
+  sessionId?: string | null,
+  projectId?: string | null,
+): Promise<BatchIngestResult> {
+  const formData = new FormData();
+  files.forEach((f) => formData.append("files", f));
+  if (sessionId) formData.append("session_id", sessionId);
+  if (projectId) formData.append("project_id", projectId);
+
+  const response = await fetch(`${getApiBase()}/documents/batch-ingest`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `Batch ingest failed: ${response.status}`);
+  }
+  return (await response.json()) as BatchIngestResult;
+}
+
+export async function getBatchStatus(batchId: string): Promise<BatchIngestResult & { progress: number }> {
+  return request<BatchIngestResult & { progress: number }>(`/documents/batch-status/${batchId}`);
+}
+
+export function subscribeBatchEvents(
+  batchId: string,
+  onProgress: (data: Record<string, unknown>) => void,
+  onDone: () => void,
+  onError: (error: string) => void,
+): EventSource {
+  const es = new EventSource(`${getApiBase()}/documents/batch-events/${batchId}`);
+
+  es.addEventListener("batch_progress", (e: MessageEvent) => {
+    onProgress(JSON.parse(e.data) as Record<string, unknown>);
+  });
+  es.addEventListener("batch_done", () => {
+    es.close();
+    onDone();
+  });
+  es.addEventListener("heartbeat", () => { /* no-op */ });
+  es.onerror = () => {
+    es.close();
+    onError("SSE 连接断开");
+  };
+  return es;
 }
 
 export async function listSkills() {

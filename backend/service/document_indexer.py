@@ -32,15 +32,23 @@ DOCUMENTS_COLLECTION = "documents"
 
 # ── 切分配置 ────────────────────────────────────────────
 
-MAX_CHUNK_CHARS = 1200       # 约 300-400 中文 tokens
-CHUNK_OVERLAP_CHARS = 120     # 滑窗 overlap
+MAX_CHUNK_CHARS = 1200
+CHUNK_OVERLAP_CHARS = 120
 CLAUSE_PATTERN = re.compile(
     r"(?:^|\n)(第[零一二三四五六七八九十百千\d]+[条章款节]|第\s*\d+\s*[条章款节]|\d+\.\s*\S)"
 )
+UPLOAD_PREFIX_PATTERN = re.compile(r"^[0-9a-fA-F]{12}_(.+)$")
 
-# ── SQLite DDL ──────────────────────────────────────────
+# ── 状态流转: ingesting → indexing → indexed (可检索) / failed (不可用) ─
 
-DDL = """
+STATUS_INGESTING = "ingesting"
+STATUS_INDEXING = "indexing"
+STATUS_INDEXED = "indexed"
+STATUS_FAILED = "failed"
+
+# ── SQLite DDL（分三步：基础建表 → 迁移 → 索引）────────────────
+
+DDL_BASE = """
 CREATE TABLE IF NOT EXISTS documents (
     doc_id       TEXT PRIMARY KEY,
     doc_name     TEXT NOT NULL,
@@ -53,12 +61,8 @@ CREATE TABLE IF NOT EXISTS documents (
     company_id   TEXT,
     chunk_count  INTEGER DEFAULT 0,
     char_count   INTEGER DEFAULT 0,
-    created_at   TEXT NOT NULL,
-    error_message TEXT
+    created_at   TEXT NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_docs_status ON documents(status);
-CREATE INDEX IF NOT EXISTS idx_docs_session ON documents(session_id);
 
 CREATE TABLE IF NOT EXISTS document_chunks (
     rowid         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,11 +80,12 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     company_id    TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_docs_status ON documents(status);
+CREATE INDEX IF NOT EXISTS idx_docs_session ON documents(session_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON document_chunks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_project ON document_chunks(project_id);
 
--- FTS5 全文索引（doc_id / project_id 为前置过滤列，UNINDEXED 表示不参与全文分词）
--- 先删旧表再重建（兼容迁移）
+-- FTS5: INSERT 由显式 executemany 驱动，DELETE 保留触发器清理
 DROP TABLE IF EXISTS document_chunks_fts;
 CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(
     content,
@@ -92,18 +97,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(
     content_rowid='rowid'
 );
 
--- 触发器：INSERT 自动同步 FTS（含过滤字段）
-CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON document_chunks BEGIN
-    INSERT INTO document_chunks_fts(rowid, content, section_title, doc_name, doc_id, project_id)
-    VALUES (new.rowid, new.content, new.section_title, new.doc_name, new.doc_id, new.project_id);
-END;
-
--- 触发器：DELETE 自动同步 FTS
+-- DELETE 触发器：chunk 删除时同步清理 FTS5
 CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON document_chunks BEGIN
     INSERT INTO document_chunks_fts(document_chunks_fts, rowid, content, section_title, doc_name, doc_id, project_id)
     VALUES ('delete', old.rowid, old.content, old.section_title, old.doc_name, old.doc_id, old.project_id);
 END;
 """
+
 
 
 class DocumentIndexer:
@@ -122,12 +122,56 @@ class DocumentIndexer:
         CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
         with self._lock:
             conn = sqlite3.connect(str(DB_PATH))
-            conn.executescript(DDL)
-            # FTS5 表被 DROP+CREATE 重建后，已有 chunks 需重新同步
-            conn.execute(
-                "INSERT INTO document_chunks_fts(rowid, content, section_title, doc_name, doc_id, project_id) "
-                "SELECT rowid, content, section_title, doc_name, doc_id, project_id FROM document_chunks"
-            )
+
+            # ① 基础建表（不依赖新增列的索引）
+            conn.executescript(DDL_BASE)
+
+            # ② 迁移：补齐旧表缺失的列
+            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+            for col, col_type in [
+                ("file_hash", "TEXT"),
+                ("updated_at", "TEXT"),
+                ("error_message", "TEXT"),
+            ]:
+                if col not in existing_cols:
+                    conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {col_type}")
+
+            # ③ 旧 status='ready' 迁移为 'indexed'
+            conn.execute("UPDATE documents SET status='indexed' WHERE status='ready'")
+
+            # ④ 现在列已存在，安全创建依赖新列的索引
+            for idx_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_docs_file_hash ON documents(file_hash)",
+                "CREATE INDEX IF NOT EXISTS idx_docs_hash_status ON documents(file_hash, status, project_id)",
+                (
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_docs_scope_hash_indexed "
+                    "ON documents("
+                    "file_hash, "
+                    "COALESCE(project_id, ''), "
+                    "COALESCE(session_id, ''), "
+                    "COALESCE(company_id, '')"
+                    ") "
+                    "WHERE status = 'indexed'"
+                ),
+            ]:
+                try:
+                    conn.execute(idx_sql)
+                except sqlite3.IntegrityError as exc:
+                    if "uq_docs_scope_hash_indexed" in idx_sql:
+                        logger.warning(
+                            "[document_indexer] skip unique index uq_docs_scope_hash_indexed due to existing duplicates: %s",
+                            exc,
+                        )
+                    else:
+                        raise
+
+            # ⑤ FTS5 表被 DROP+CREATE 重建后，已有 chunks 需重新同步（只做一次）
+            count = conn.execute("SELECT COUNT(*) AS cnt FROM document_chunks_fts").fetchone()[0]
+            if count == 0:
+                conn.execute(
+                    "INSERT INTO document_chunks_fts(rowid, content, section_title, doc_name, doc_id, project_id) "
+                    "SELECT rowid, content, section_title, doc_name, doc_id, project_id FROM document_chunks"
+                )
             conn.commit()
             conn.close()
 
@@ -173,33 +217,63 @@ class DocumentIndexer:
         seq = (row["cnt"] if row else 0) + 1
         return f"DOC-{today}-{seq:03d}"
 
-    # ── 切分逻辑 ─────────────────────────────────────────
+    def _normalize_doc_name(self, doc_name: str) -> str:
+        match = UPLOAD_PREFIX_PATTERN.match(doc_name)
+        if match:
+            return match.group(1)
+        return doc_name
 
-    def _split_by_headings(self, text: str) -> list[tuple[str, str | None]]:
-        """按 Markdown 标题切分，返回 [(正文, 章节标题), ...]"""
-        sections = re.split(r"(^#{2,4}\s+.+$)", text, flags=re.MULTILINE)
-        chunks: list[tuple[str, str | None]] = []
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    # ── 切分逻辑 ────────────────────────────────────────
+
+    @staticmethod
+    def _heading_level(line: str) -> int | None:
+        """返回 heading 层级（2-6），非标题返回 None。"""
+        stripped = line.lstrip()
+        if not stripped.startswith("#"):
+            return None
+        level = len(stripped) - len(stripped.lstrip("#"))
+        if level < 1 or level > 6:
+            return None
+        if len(stripped) <= level or not stripped[level].isspace():
+            return None
+        return level
+
+    @staticmethod
+    def _heading_text(line: str) -> str:
+        stripped = line.lstrip()
+        level = DocumentIndexer._heading_level(stripped)
+        if level is None:
+            return ""
+        return stripped[level:].strip()
+
+    def _split_by_headings(self, text: str, target_level: int) -> list[tuple[str, str | None]]:
+        """按指定层级标题切分，返回 [(正文, 章节标题)]。"""
+        sections: list[tuple[str, str | None]] = []
+        current_lines: list[str] = []
         current_title: str | None = None
 
-        for part in sections:
-            part_stripped = part.strip()
-            if not part_stripped:
-                continue
-            if re.match(r"^#{2,4}\s+", part_stripped):
-                current_title = re.sub(r"^#{2,4}\s+", "", part_stripped).strip()
+        for line in text.splitlines():
+            level = self._heading_level(line)
+            if level is not None and level == target_level:
+                if current_lines:
+                    sections.append(("\n".join(current_lines).strip(), current_title))
+                current_lines = [line]
+                current_title = self._heading_text(line)
             else:
-                if current_title:
-                    chunks.append((part_stripped, current_title))
-                else:
-                    chunks.append((part_stripped, None))
-        return chunks
+                current_lines.append(line)
+
+        if current_lines:
+            sections.append(("\n".join(current_lines).strip(), current_title))
+        return [(content, title) for content, title in sections if content]
 
     def _split_by_clauses(self, text: str) -> list[str]:
-        """按条款编号二次切分。"""
+        """按条款编号（第X条/第X章）切分。"""
         parts = CLAUSE_PATTERN.split(text)
         result: list[str] = []
         buffer = ""
-
         for part in parts:
             if CLAUSE_PATTERN.match(part):
                 if buffer.strip():
@@ -207,52 +281,111 @@ class DocumentIndexer:
                 buffer = part
             else:
                 buffer += part
-
         if buffer.strip():
             result.append(buffer.strip())
         return result or [text]
 
     def _split_by_length(self, text: str, max_chars: int, overlap: int) -> list[str]:
-        """按字符长度兜底切分，尽量在句末断。"""
+        """按字符长度滑窗切分，尽量在句末断。"""
         if len(text) <= max_chars:
             return [text]
-
         result: list[str] = []
         start = 0
         while start < len(text):
             end = min(start + max_chars, len(text))
             if end < len(text):
-                # 回退到最近的句号/换行
-                for sep in ("\n", "。", "；", "，", " "):
+                for sep in ("\n\n", "\n", "。", "；", "，"):
                     last = text.rfind(sep, start, end)
                     if last > start + max_chars // 2:
-                        end = last + 1
+                        end = last + len(sep)
                         break
             result.append(text[start:end].strip())
             start = end - overlap if end < len(text) else len(text)
         return result
 
+    def _recursive_chunk(
+        self, text: str, title: str | None, level: int
+    ) -> list[dict[str, Any]]:
+        """递归切分：标题层级 → 条款 → 滑窗兜底。
+
+        从指定层级标题开始切。每段不超长就保留，超长才下钻到下一级。
+        """
+        text = text.strip()
+        if not text:
+            return []
+
+        # 不超长 → 直接保留
+        if len(text) <= MAX_CHUNK_CHARS:
+            return [{"content": text, "section_title": title, "token_count": len(text)}]
+
+        # 还有更低级标题可切 → 下钻
+        if level <= 5:
+            sub_sections = self._split_by_headings(text, target_level=level + 1)
+            if len(sub_sections) >= 2:  # 确实切出了多个子段
+                chunks: list[dict[str, Any]] = []
+                for sub_text, sub_title in sub_sections:
+                    chunks.extend(self._recursive_chunk(sub_text, sub_title or title, level + 1))
+                return chunks
+
+        # 标题不够用 → 条款切分
+        if level <= 6:  # 对任意层级都可以尝试条款
+            clause_parts = self._split_by_clauses(text)
+            if len(clause_parts) >= 2:
+                chunks = []
+                for clause in clause_parts:
+                    if len(clause) <= MAX_CHUNK_CHARS:
+                        chunks.append({"content": clause, "section_title": title, "token_count": len(clause)})
+                    else:
+                        chunks.extend([
+                            {"content": p, "section_title": title, "token_count": len(p)}
+                            for p in self._split_by_length(clause, MAX_CHUNK_CHARS, CHUNK_OVERLAP_CHARS)
+                        ])
+                return chunks
+
+        # 最终兜底：滑窗切分
+        return [
+            {"content": p, "section_title": title, "token_count": len(p)}
+            for p in self._split_by_length(text, MAX_CHUNK_CHARS, CHUNK_OVERLAP_CHARS)
+        ]
+
+    def _detect_top_heading_level(self, text: str) -> int:
+        """找到文本中最高标题层级，没有标题返回 6。"""
+        min_level = 6
+        for line in text.splitlines():
+            level = self._heading_level(line)
+            if level is not None and level < min_level:
+                min_level = level
+        return min_level
+
     def _chunk_document(self, text: str) -> list[dict[str, Any]]:
-        """三阶段切分：标题 → 条款 → 长度兜底。"""
-        heading_sections = self._split_by_headings(text)
-        if not heading_sections:
-            heading_sections = [(text, None)]
+        """入口：检测最高标题层级，从该层开始递归切分。"""
+        text = text.strip()
+        if not text:
+            return []
 
-        all_chunks: list[dict[str, Any]] = []
-        for section_text, section_title in heading_sections:
-            clause_parts = self._split_by_clauses(section_text)
-            for clause_text in clause_parts:
-                length_parts = self._split_by_length(
-                    clause_text, MAX_CHUNK_CHARS, CHUNK_OVERLAP_CHARS
-                )
-                for part in length_parts:
-                    all_chunks.append({
-                        "content": part,
-                        "section_title": section_title,
-                        "token_count": len(part),  # 近似：字符数
-                    })
+        top_level = self._detect_top_heading_level(text)
+        top_sections = self._split_by_headings(text, target_level=top_level)
+        if len(top_sections) <= 1:
+            # 只有一个顶层块或无标题 → 直接递归
+            return self._recursive_chunk(text, None, top_level)
 
-        return all_chunks
+        chunks: list[dict[str, Any]] = []
+        for section_text, section_title in top_sections:
+            chunks.extend(self._recursive_chunk(section_text, section_title, top_level))
+        return chunks
+
+    # ── 状态标记 ─────────────────────────────────────────
+
+    def _mark_failed(self, doc_id: str, message: str) -> None:
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "UPDATE documents SET status=?, error_message=?, updated_at=? WHERE doc_id=?",
+                (STATUS_FAILED, message, self._now_iso(), doc_id),
+            )
+            conn.commit()
+            conn.close()
+        logger.error("[ingest] doc_id=%s FAILED: %s", doc_id, message)
 
     # ── 入库主流程 ───────────────────────────────────────
 
@@ -266,128 +399,201 @@ class DocumentIndexer:
         project_id: str | None = None,
         company_id: str | None = None,
     ) -> dict[str, Any]:
-        """读取文档文件 → 切分 → 写入 SQLite + Chroma。PDF/Word 自动走 MinerU 解析。"""
+        """读取文档文件 → 切分 → 批量写入 SQLite + Chroma。"""
         src = Path(source_path)
-        if not src.exists():
-            return {"error": f"文件不存在: {source_path}"}
 
+        # ── 0. 前置校验（无 doc_id） ──
+        if not src.exists():
+            return {"ok": False, "error": f"文件不存在: {source_path}"}
         ext = src.suffix.lower()
         if ext not in {".md", ".txt", ".pdf", ".docx", ".doc"}:
-            return {"error": f"不支持的格式：{ext}，支持 PDF / Word / Markdown / 纯文本"}
-
-        # PDF/Word → MinerU 解析；.md/.txt → 直接读
-        if ext in {".pdf", ".docx", ".doc"}:
-            try:
-                from service.mineru_parser import parse_with_mineru
-                text = parse_with_mineru(src)
-            except RuntimeError as exc:
-                return {"error": f"MinerU 解析失败: {exc}"}
-        else:
-            text = src.read_text(encoding="utf-8").strip()
-        if not text:
-            return {"error": "文件内容为空"}
-
+            return {"ok": False, "error": f"不支持的格式：{ext}，支持 PDF / Word / Markdown / 纯文本"}
         if not doc_name:
             doc_name = src.name
+        doc_name = self._normalize_doc_name(doc_name)
 
+        # ── 1. 读取文件 + 生成 doc_id ──
+        file_hash: str
+        text: str
+        try:
+            if ext in {".pdf", ".docx", ".doc", ".md", ".txt"}:
+                from service.document_parser import parse_uploaded_file
+                from service.mineru_parser import compute_file_hash
+                file_hash = compute_file_hash(src)
+                text = parse_uploaded_file(src, file_hash=file_hash)
+            else:
+                from hashlib import sha256
+                file_hash = sha256(src.read_bytes()).hexdigest()
+                text = src.read_text(encoding="utf-8").strip()
+        except RuntimeError as exc:
+            return {"ok": False, "error": f"文件读取/解析失败: {exc}"}
+        except Exception as exc:
+            logger.exception("[ingest] file read error")
+            return {"ok": False, "error": f"文件读取失败: {exc}"}
+
+        if not text:
+            return {"ok": False, "error": "文件内容为空"}
+
+        # doc_id 在此生成 — 文件存在且可读后
         doc_id = self._generate_doc_id()
-        now = datetime.now(timezone.utc).isoformat()
+        now = self._now_iso()
 
-        # Step 1: 写入 documents 表
+        # ── 2. INSERT documents (status='ingesting') ──
         with self._lock:
             conn = self._get_conn()
+
+            # 去重：同一 hash 且 scope 下已有 indexed 文档
+            existing = conn.execute(
+                """SELECT doc_id FROM documents
+                   WHERE file_hash = ? AND status = ?
+                     AND (? IS NULL OR project_id = ?)
+                     AND (? IS NULL OR session_id = ?)
+                   LIMIT 1""",
+                (file_hash, STATUS_INDEXED, project_id, project_id, session_id, session_id),
+            ).fetchone()
+            if existing:
+                conn.close()
+                logger.info("[ingest] dedup hit: hash=%s existing=%s", file_hash[:12], existing["doc_id"])
+                return {"ok": True, "doc_id": existing["doc_id"], "status": STATUS_INDEXED}
+
             conn.execute(
                 """INSERT INTO documents (doc_id, doc_name, source_path, content_type,
                    status, session_id, batch_id, project_id, company_id,
-                   chunk_count, char_count, created_at)
-                   VALUES (?,?,?,?,?,'ingesting',?,?,?,?,0,?,?)""",
+                   file_hash, chunk_count, char_count, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?)""",
                 (doc_id, doc_name, source_path, ext,
-                 session_id, batch_id, project_id, company_id,
-                 len(text), now),
+                 STATUS_INGESTING, session_id, batch_id, project_id, company_id,
+                 file_hash, len(text), now,  # 12个tuple值,匹配12个?: 10个字段+0(chunk_count)+char_count+created_at
+                ),
             )
             conn.commit()
             conn.close()
 
-        # Step 2: 切分
+        # ── 3. 切分 ──
         try:
             chunks = self._chunk_document(text)
         except Exception as exc:
-            self._mark_error(doc_id, f"切分失败: {exc}")
-            return {"error": f"切分失败: {exc}"}
+            self._mark_failed(doc_id, f"切分失败: {exc}")
+            return {"ok": False, "doc_id": doc_id, "status": STATUS_FAILED, "error": f"切分失败: {exc}"}
 
         if not chunks:
-            self._mark_error(doc_id, "切分结果为空")
-            return {"error": "切分结果为空"}
+            self._mark_failed(doc_id, "文档切分结果为空")
+            return {"ok": False, "doc_id": doc_id, "status": STATUS_FAILED, "error": "文档切分结果为空"}
 
-        # Step 3: 写入 SQLite chunks + Chroma
+        # ── 4. 构建批量写入数据 ──
+        chunk_rows: list[tuple] = []
+        chunk_ids: list[str] = []
+        chroma_contents: list[str] = []
+        chroma_metadatas: list[dict] = []
+        base_meta = {
+            "doc_id": doc_id, "doc_name": doc_name, "source_path": source_path,
+        }
+        if session_id:
+            base_meta["session_id"] = session_id
+        if project_id:
+            base_meta["project_id"] = project_id
+
+        for idx, ch in enumerate(chunks):
+            cid = f"{doc_id}-{idx:04d}"
+            chunk_ids.append(cid)
+            chunk_rows.append((
+                cid, doc_id, idx, doc_name, ch["content"],
+                ch.get("section_title"), ch["token_count"], source_path,
+                session_id, batch_id, project_id, company_id,
+            ))
+            meta = {
+                **base_meta,
+                "chunk_id": cid,
+                "chunk_index": idx,
+                "section_title": ch.get("section_title") or "",
+            }
+            chroma_contents.append(ch["content"])
+            chroma_metadatas.append(meta)
+
+        # ── 5. SQLite 事务: document_chunks + FTS5 ──
         try:
-            chroma = self._get_vector_store()
-            lc_docs: list[LCDocument] = []
-
             with self._lock:
                 conn = self._get_conn()
-                for idx, ch in enumerate(chunks):
-                    chunk_id = f"{doc_id}-{idx:04d}"
-                    conn.execute(
+                try:
+                    conn.execute("BEGIN")
+                    conn.executemany(
                         """INSERT INTO document_chunks
                            (chunk_id, doc_id, chunk_index, doc_name, content,
                             section_title, token_count, source_path,
                             session_id, batch_id, project_id, company_id)
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            chunk_id, doc_id, idx, doc_name, ch["content"],
-                            ch.get("section_title"), ch["token_count"], source_path,
-                            session_id, batch_id, project_id, company_id,
-                        ),
+                        chunk_rows,
                     )
+                    # 显式批量写 FTS5（不依赖触发器）
+                    conn.executemany(
+                        """INSERT INTO document_chunks_fts
+                           (rowid, content, section_title, doc_name, doc_id, project_id)
+                           SELECT rowid, content, section_title, doc_name, doc_id, project_id
+                           FROM document_chunks WHERE chunk_id = ?""",
+                        [(cid,) for cid in chunk_ids],
+                    )
+                    conn.execute(
+                        "UPDATE documents SET status=?, chunk_count=?, updated_at=? WHERE doc_id=?",
+                        (STATUS_INDEXING, len(chunks), self._now_iso(), doc_id),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+                finally:
+                    conn.close()
+        except Exception as exc:
+            self._mark_failed(doc_id, f"SQLite 写入失败: {exc}")
+            return {"ok": False, "doc_id": doc_id, "status": STATUS_FAILED, "error": f"SQLite 写入失败: {exc}"}
 
-                    metadata = {
-                        "chunk_id": chunk_id,
-                        "doc_id": doc_id,
-                        "chunk_index": idx,
-                        "doc_name": doc_name,
-                        "section_title": ch.get("section_title") or "",
-                        "source_path": source_path,
-                    }
-                    if session_id: metadata["session_id"] = session_id
-                    if project_id: metadata["project_id"] = project_id
+        # ── 6. Chroma 批量写入（使用稳定 chunk_id） ──
+        cleanup_error: str | None = None
+        try:
+            chroma = self._get_vector_store()
+            if chroma:
+                chroma.add_texts(texts=chroma_contents, metadatas=chroma_metadatas, ids=chunk_ids)
+        except Exception as exc:
+            # 补偿清理
+            try:
+                chroma.delete(ids=chunk_ids)
+            except Exception:
+                try:
+                    chroma.delete(where={"doc_id": doc_id})
+                except Exception as ce:
+                    cleanup_error = str(ce)
+                    logger.error("[ingest] doc_id=%s Chroma cleanup failed: %s", doc_id, ce)
 
-                    lc_docs.append(LCDocument(page_content=ch["content"], metadata=metadata))
+            self._mark_failed(doc_id, f"Chroma 写入失败: {exc}")
+            result: dict = {
+                "ok": False, "doc_id": doc_id, "status": STATUS_FAILED,
+                "error": f"Chroma 写入失败: {exc}",
+            }
+            if cleanup_error:
+                result["cleanup_error"] = cleanup_error
+            return result
 
+        # ── 7. 更新 status='indexed' ──
+        try:
+            with self._lock:
+                conn = self._get_conn()
                 conn.execute(
-                    "UPDATE documents SET status='ready', chunk_count=? WHERE doc_id=?",
-                    (len(chunks), doc_id),
+                    "UPDATE documents SET status=?, chunk_count=?, updated_at=?, error_message=NULL WHERE doc_id=?",
+                    (STATUS_INDEXED, len(chunks), self._now_iso(), doc_id),
                 )
                 conn.commit()
                 conn.close()
-
-            # 写 Chroma
-            if chroma and lc_docs:
-                chroma.add_documents(lc_docs)
-
         except Exception as exc:
-            self._mark_error(doc_id, f"写入失败: {exc}")
-            return {"error": f"写入失败: {exc}"}
+            logger.error("[ingest] doc_id=%s status update to indexed failed: %s", doc_id, exc)
+            return {
+                "ok": False, "doc_id": doc_id, "status": STATUS_INDEXING,
+                "error": f"状态更新失败（数据已写入但 status 保持 indexing）: {exc}",
+            }
 
-        logger.info("Document ingested: doc_id=%s chunks=%d", doc_id, len(chunks))
+        logger.info("[ingest] done: doc_id=%s chunks=%d", doc_id, len(chunks))
         return {
-            "ok": True,
-            "doc_id": doc_id,
-            "doc_name": doc_name,
-            "chunk_count": len(chunks),
-            "char_count": len(text),
+            "ok": True, "doc_id": doc_id, "status": STATUS_INDEXED,
+            "chunk_count": len(chunks), "char_count": len(text),
         }
-
-    def _mark_error(self, doc_id: str, message: str) -> None:
-        with self._lock:
-            conn = self._get_conn()
-            conn.execute(
-                "UPDATE documents SET status='error', error_message=? WHERE doc_id=?",
-                (message, doc_id),
-            )
-            conn.commit()
-            conn.close()
-        logger.error("Document ingest error: doc_id=%s error=%s", doc_id, message)
 
     # ── 检索 ─────────────────────────────────────────────
 
@@ -401,8 +607,7 @@ class DocumentIndexer:
         company_id: str | None = None,
         top_k: int = 5,
     ) -> list[dict[str, Any]]:
-        """混合检索：Chroma 向量 + FTS5 全文 → RRF 融合。"""
-        # 必须至少一个范围过滤
+        """混合检索：Chroma 向量 + FTS5 全文 → RRF 融合。只返回 status='indexed' 文档的 chunks。"""
         if not any([doc_id, session_id, project_id, company_id]):
             return [{"error": "必须指定检索范围：doc_id / session_id / project_id / company_id 至少一个"}]
 
@@ -425,14 +630,29 @@ class DocumentIndexer:
                 query, k=top_k, filter=chroma_filter if chroma_filter else None
             )
         except Exception as exc:
-            logger.warning("Chroma dense search failed: %s", exc)
+            logger.warning("[dense] search failed: %s", exc)
             return []
+
+        # 收集所有涉及的 doc_id，批量检查其 status
+        doc_ids = list({doc.metadata.get("doc_id", "") for doc, _ in docs_with_scores if doc.metadata.get("doc_id")})
+        indexed_docs: set[str] = set()
+        if doc_ids:
+            conn = self._get_conn()
+            rows = conn.execute(
+                f"SELECT doc_id FROM documents WHERE doc_id IN ({','.join(['?']*len(doc_ids))}) AND status = ?",
+                (*doc_ids, STATUS_INDEXED),
+            ).fetchall()
+            conn.close()
+            indexed_docs = {r["doc_id"] for r in rows}
 
         results: list[dict[str, Any]] = []
         for doc, score in docs_with_scores:
+            d_id = doc.metadata.get("doc_id", "")
+            if d_id not in indexed_docs:
+                continue  # 过滤非 indexed 文档
             results.append({
                 "chunk_id": doc.metadata.get("chunk_id", ""),
-                "doc_id": doc.metadata.get("doc_id", ""),
+                "doc_id": d_id,
                 "doc_name": doc.metadata.get("doc_name", ""),
                 "content": doc.page_content,
                 "section_title": doc.metadata.get("section_title", ""),
@@ -448,19 +668,16 @@ class DocumentIndexer:
         try:
             conn = self._get_conn()
 
-            # 前置过滤条件直接打在 FTS5 表上，先过滤再 BM25 评分
             fts_where_parts = ["document_chunks_fts MATCH ?"]
-            c_where_parts: list[str] = []
-            params: list[Any] = [query]
+            c_where_parts = ["d.status = ?"]
+            params: list[Any] = [query, STATUS_INDEXED]
 
-            # doc_id / project_id 在 FTS5 表上有 UNINDEXED 列，优先前置过滤
             for fts_col in ("doc_id", "project_id"):
                 val = filters.get(fts_col)
                 if val:
                     fts_where_parts.append(f"f.{fts_col} = ?")
                     params.append(val)
 
-            # session_id / company_id 只在 document_chunks 表
             for c_col in ("session_id", "company_id"):
                 val = filters.get(c_col)
                 if val:
@@ -468,14 +685,15 @@ class DocumentIndexer:
                     params.append(val)
 
             fts_where = " AND ".join(fts_where_parts)
-            c_where = (" AND " + " AND ".join(c_where_parts)) if c_where_parts else ""
+            c_where = " AND ".join(c_where_parts)
 
             sql = f"""
                 SELECT c.chunk_id, c.doc_id, c.doc_name, c.content, c.section_title,
                        c.chunk_index, c.source_path, rank AS bm25_score
                 FROM document_chunks_fts f
                 JOIN document_chunks c ON f.rowid = c.rowid
-                WHERE {fts_where}{c_where}
+                JOIN documents d ON c.doc_id = d.doc_id
+                WHERE {fts_where} AND {c_where}
                 ORDER BY rank
                 LIMIT ?
             """
@@ -483,7 +701,7 @@ class DocumentIndexer:
             rows = conn.execute(sql, params).fetchall()
             conn.close()
         except Exception as exc:
-            logger.warning("FTS5 search failed: %s", exc)
+            logger.warning("[fts] search failed: %s", exc)
             return []
 
         return [
@@ -537,7 +755,7 @@ class DocumentIndexer:
         *,
         session_id: str | None = None,
         project_id: str | None = None,
-        status: str | None = "ready",
+        status: str | None = STATUS_INDEXED,
     ) -> list[dict[str, Any]]:
         conn = self._get_conn()
         where = ["1=1"]
@@ -557,7 +775,12 @@ class DocumentIndexer:
             params,
         ).fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["doc_name"] = self._normalize_doc_name(str(item.get("doc_name", "")))
+            results.append(item)
+        return results
 
 
 # 全局单例

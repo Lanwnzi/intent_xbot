@@ -26,8 +26,15 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".md", ".txt"}
 
 
 class ContractReviewInput(BaseModel):
-    file_path: str = Field(..., description="合同文件的绝对路径，支持 PDF / Word / Markdown / 纯文本")
-    contract_name: str = Field(default="", description="合同名称，为空时自动从文件名提取")
+    file_path: str | None = Field(
+        default=None,
+        description="合同文件的绝对路径，支持 PDF / Word / Markdown / 纯文本；file_path 和 doc_id 至少传一个",
+    )
+    doc_id: str | None = Field(
+        default=None,
+        description="已入库文档 ID，例如 DOC-20260527-003；传入后工具会自动从数据库绑定真实文件路径",
+    )
+    contract_name: str = Field(default="", description="合同名称，为空时自动从文件名或数据库文档名提取")
 
 
 class ContractReviewTool(BaseTool):
@@ -39,10 +46,14 @@ class ContractReviewTool(BaseTool):
 
     name: str = "contract_review"
     description: str = (
-        "审核合同文件并生成审核报告。内部自动完成文件解析、风险分析、报告保存。"
-        "返回 report_id、report_path、summary 和 risk_count。"
-        "支持 PDF、Word、Markdown 和纯文本格式。"
-        "注意：文件解析可能需要数分钟（取决于文件大小和 MinerU 服务速度）。"
+"调用条件：仅当用户明确提出需要对合同内容进行审查、审核、风险分析、合规检查等操作，并且明确要求生成、出示或导出审核报告时，才允许调用此工具。"
+"如果用户只是上传合同、询问合同内容、查询某个条款、总结合同、修改合同、生成合同、提取信息或进行普通文档问答，不得调用此工具，应优先使用合同检索、文档解析或普通问答能力。"
+"触发条件必须同时满足：1）用户意图是合同审查/风险审核；2）用户要求输出审核报告。"
+"审核合同文件并生成审核报告。内部自动完成文件解析、风险分析、报告保存。"
+"返回 report_id、report_path、summary 和 risk_count。"
+"支持 PDF、Word、Markdown 和纯文本格式。"
+"可传 file_path，也可传已入库文档 doc_id；传 doc_id 时会自动绑定数据库中的 source_path。"
+"注意：文件解析可能需要数分钟（取决于文件大小和 MinerU 服务速度）。"
     )
     args_schema: Type[BaseModel] = ContractReviewInput
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -60,6 +71,31 @@ class ContractReviewTool(BaseTool):
         if self._root_dir not in candidate.parents and candidate != self._root_dir:
             raise ValueError(f"路径安全校验失败：文件必须在项目目录内。got: {path_str}")
         return candidate
+
+    def _resolve_doc_id(self, doc_id: str) -> tuple[Path, str]:
+        """通过入库文档 ID 反查真实文件路径。
+
+        输入：后台文档 ID，例如 DOC-20260527-003。
+        输出：项目内真实文件路径、数据库中的文档名。
+        目的：让 Agent 在用户确认文档列表项后，可以直接用 doc_id 审核，不再把文件名误当 file_path。
+        """
+        from service.document_indexer import document_indexer
+
+        conn = document_indexer._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT doc_name, source_path, status FROM documents WHERE doc_id = ? LIMIT 1",
+                (doc_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not row:
+            raise ValueError(f"未找到文档ID：{doc_id}")
+        if row["status"] != "indexed":
+            raise ValueError(f"文档 {doc_id} 当前状态为 {row['status']}，尚不可审核")
+
+        return self._resolve_path(str(row["source_path"])), str(row["doc_name"] or "")
 
     # ── 格式判断 ──────────────────────────────────────────
 
@@ -205,13 +241,21 @@ class ContractReviewTool(BaseTool):
 
     def _run(
         self,
-        file_path: str,
+        file_path: str | None = None,
         contract_name: str = "",
+        doc_id: str | None = None,
         run_manager: CallbackManagerForToolRun | None = None,
     ) -> str:
         # Step 0: 参数校验
         try:
-            path = self._resolve_path(file_path)
+            if doc_id:
+                path, db_contract_name = self._resolve_doc_id(doc_id)
+                if not contract_name:
+                    contract_name = db_contract_name
+            elif file_path:
+                path = self._resolve_path(file_path)
+            else:
+                return json.dumps({"error": "缺少参数：file_path 和 doc_id 至少需要提供一个"}, ensure_ascii=False)
         except ValueError as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
@@ -222,7 +266,7 @@ class ContractReviewTool(BaseTool):
                 ensure_ascii=False,
             )
         if not path.exists():
-            return json.dumps({"error": f"文件不存在：{file_path}"}, ensure_ascii=False)
+            return json.dumps({"error": f"文件不存在：{path}"}, ensure_ascii=False)
         if not contract_name:
             contract_name = path.stem
 
@@ -281,8 +325,9 @@ class ContractReviewTool(BaseTool):
 
     async def _arun(
         self,
-        file_path: str,
+        file_path: str | None = None,
         contract_name: str = "",
+        doc_id: str | None = None,
         run_manager: AsyncCallbackManagerForToolRun | None = None,
     ) -> str:
-        return await asyncio.to_thread(self._run, file_path, contract_name, None)
+        return await asyncio.to_thread(self._run, file_path, contract_name, doc_id, None)
